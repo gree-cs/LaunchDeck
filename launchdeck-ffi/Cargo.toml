@@ -1,0 +1,16 @@
+[package]
+name = "launchdeck-ffi"
+version = "0.3.0"
+edition = "2021"
+description = "LaunchDeck FFI layer for Swift interop"
+
+[dependencies]
+launchdeck-core = { path = "../launchdeck-core" }
+libc = "0.2"
+
+[lib]
+name = "launchdeck_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[build-dependencies]
+cc = "1.0"
