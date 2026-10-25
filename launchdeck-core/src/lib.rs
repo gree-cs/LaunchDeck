@@ -6,6 +6,7 @@ pub mod error;
 pub mod model;
 pub mod config;
 pub mod scanner;
+pub mod uninstall;
 pub mod util;
 
 pub use error::{LaunchDeckError, Result};

@@ -10,7 +10,7 @@ launchdeck-gui    eframe + egui 前端（进程入口）
 launchdeck-ffi    C ABI 导出，供 Swift / 其他语言调用
 ```
 
-`launchdeck-core` 只依赖 `serde` / `dirs` / `walkdir`，可以在其他前端（比如 SwiftUI）里复用扫描、配置和布局模型。
+`launchdeck-core` 只依赖 `serde` / `dirs` / `walkdir`，可以在其他前端（比如 SwiftUI）里复用扫描、配置、布局模型和残留扫描（`uninstall.rs`）。
 
 ## 2. 数据结构
 
@@ -26,6 +26,8 @@ AppSettings
   display_mode / hotkey / show_dock_icon / show_menu_bar_icon / launch_at_login
   theme / grid_size / background / icon_style / hot_corner / hide_after_launch
   show_on / return_home / option_uninstall / hide_hidden_in_search
+  sort_folders_too / apple_placement / custom_sources / pinch_gesture
+  auto_update / auto_download
 ```
 
 - 布局持久化在 `layout.json`，设置持久化在 `settings.json`。
@@ -37,11 +39,12 @@ AppSettings
 main()
  └─ eframe::run_native
      └─ LaunchDeckApp::update()   每帧执行
-         ├─ 处理原生事件（热键 / 菜单 / 触发角 / F4 / 横扫）
-         ├─ 扫描线程轮询（应用列表 + 图标导出结果）
+         ├─ 处理原生事件（热键 / 菜单 / 触发角 / F4 / 横扫 / 捏合）
+         ├─ 扫描线程轮询（应用列表 + 图标导出结果；唤出启动台时距上次扫描超 30s 自动重扫）
+         ├─ 更新检查轮询（GitHub Releases，启动时按设置触发）
          ├─ 壁纸纹理轮询
          ├─ 键盘处理（Esc / 方向键 / 搜索）
-         ├─ ui::draw()            绘制启动台 / 设置 / 卸载 / 文件夹
+         ├─ ui::draw()            绘制启动台 / 设置 / 深度卸载 / 文件夹
          └─ 动画推进（打开淡入、关闭淡出、自动收起判断）
 ```
 
@@ -96,10 +99,15 @@ main()
 | 全局快捷键 | `RegisterEventHotKey` + `InstallEventHandler`（Carbon） |
 | F4 | 同上，第二个 EventHotKeyID |
 | 触控板横扫 | `CGEventTapCreate` 监听 `scrollWheel` 的横向分量 |
+| 触控板捏合 | `NSEvent addGlobalMonitorForEventsMatchingMask:`（Magnify，手搭全局 block，无需辅助功能权限） |
+| 多屏定位 | `NSScreen.screens` 枚举 + `NSEvent.mouseLocation`（鼠标屏）+ `CGWindowListCopyWindowInfo`（Dock 屏 / 活动屏） |
 | 菜单栏图标 | `NSStatusBar.statusItemWithLength`，按钮使用 action 区分左右键 |
 | 菜单栏点击行为 | 左键 → 打开启动台；右键 → `popUpContextMenu:` |
 | Dock reopen | 给 `NSApplication.delegate` 动态挂 `applicationShouldHandleReopen:hasVisibleWindows:` |
 | 应用激活 | `NSRunningApplication.activateWithOptions:` |
+| 运行检测 / 退出 | `NSWorkspace.sharedWorkspace.runningApplications`（按 bundle 路径匹配），`terminate` / `forceTerminate` |
+| 废纸篓音效 | `NSSound soundNamed:`（dragToTrash，缺失时退回 Pop） |
+| 添加到程序坞 | `defaults write com.apple.dock persistent-apps -array-add` + `killall Dock` |
 | 窗口层级 | `NSWindow.setLevel:`（全屏 25 / 窗口 21 / 默认 0） |
 | 菜单栏 & Dock 隐藏 | `setPresentationOptions:`（`HideMenuBar|HideDock`，必须成对） |
 | Dock 图标显示/隐藏 | `NSApplication.setActivationPolicy:` |

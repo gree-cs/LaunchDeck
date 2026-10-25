@@ -16,6 +16,12 @@ pub struct AppInfo {
     pub modified: SystemTime,          // 修改时间
     pub is_hidden: bool,               // 是否隐藏
     pub is_system: bool,               // 是否系统应用
+    /// 该条目是替身文件/符号链接而非真实 .app 目录
+    #[serde(default)]
+    pub is_alias: bool,
+    /// 替身文件本身的路径（is_alias 为 true 时指向替身，path 已解析为目标）
+    #[serde(default)]
+    pub alias_path: Option<String>,
 }
 
 /// 组/文件夹信息
@@ -58,6 +64,18 @@ pub struct AppSettings {
     pub option_uninstall: bool,
     /// 自动下载更新
     pub auto_download: bool,
+    /// 排序时同时排序文件夹内的应用
+    #[serde(default)]
+    pub sort_folders_too: bool,
+    /// 排序时 Apple 应用相对用户应用的位置
+    #[serde(default)]
+    pub apple_placement: ApplePlacement,
+    /// 用户自定义扫描目录（在默认目录之外追加）
+    #[serde(default)]
+    pub custom_sources: Vec<String>,
+    /// 触控板捏合手势打开启动台
+    #[serde(default)]
+    pub pinch_gesture: PinchGesture,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,10 +126,56 @@ impl ScreenChoice {
     }
 }
 
+/// Apple 应用在排序中的位置
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ApplePlacement {
+    /// 排在用户应用之前
+    Before,
+    /// 排在用户应用之后
+    After,
+    /// 与其他应用混排
+    #[default]
+    Mixed,
+}
+
+impl ApplePlacement {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ApplePlacement::Before => "应用之前",
+            ApplePlacement::After => "应用之后",
+            ApplePlacement::Mixed => "与其他应用混排",
+        }
+    }
+}
+
+/// 触控板捏合手势
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PinchGesture {
+    #[default]
+    Off,
+    Three,
+    FourOrFive,
+    Five,
+}
+
+impl PinchGesture {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PinchGesture::Off => "关",
+            PinchGesture::Three => "三指捏合",
+            PinchGesture::FourOrFive => "四指或五指捏合",
+            PinchGesture::Five => "五指捏合",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReturnHome {
     Never,
+    Always,
     FiveMinutes,
     OneMinute,
     ThirtySeconds,
@@ -127,11 +191,24 @@ impl ReturnHome {
     pub fn label(&self) -> &'static str {
         match self {
             ReturnHome::Never => "从不",
+            ReturnHome::Always => "始终",
             ReturnHome::FiveMinutes => "5 分钟后",
             ReturnHome::OneMinute => "1 分钟后",
             ReturnHome::ThirtySeconds => "30 秒后",
             ReturnHome::FifteenSeconds => "15 秒后",
             ReturnHome::FiveSeconds => "5 秒后",
+        }
+    }
+
+    /// 关闭超过该时长才回首页；None = 不按时长（始终/从不）
+    pub fn threshold(&self) -> Option<std::time::Duration> {
+        match self {
+            ReturnHome::Never | ReturnHome::Always => None,
+            ReturnHome::FiveMinutes => Some(std::time::Duration::from_secs(300)),
+            ReturnHome::OneMinute => Some(std::time::Duration::from_secs(60)),
+            ReturnHome::ThirtySeconds => Some(std::time::Duration::from_secs(30)),
+            ReturnHome::FifteenSeconds => Some(std::time::Duration::from_secs(15)),
+            ReturnHome::FiveSeconds => Some(std::time::Duration::from_secs(5)),
         }
     }
 }
@@ -215,6 +292,10 @@ impl Default for AppSettings {
             return_home: ReturnHome::FiveMinutes,
             option_uninstall: true,
             auto_download: false,
+            sort_folders_too: false,
+            apple_placement: ApplePlacement::Mixed,
+            custom_sources: Vec::new(),
+            pinch_gesture: PinchGesture::Off,
         }
     }
 }

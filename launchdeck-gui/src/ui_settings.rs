@@ -9,8 +9,9 @@
 pub const SET_W: f32 = 400.0;
 pub const TAB_H: [f32; 5] = [566.0, 630.0, 482.0, 630.0, 644.0];
 
-const WIN_BG: Color32 = Color32::from_rgb(30, 30, 29);
-const CARD_BG: Color32 = Color32::from_rgb(37, 37, 36);
+// 玻璃质感：半透明深色底（透出桌面）+ 半透明卡片（premultiplied：RGB ≤ A）
+const WIN_BG: Color32 = Color32::from_rgba_premultiplied(20, 21, 26, 228);
+const CARD_BG: Color32 = Color32::from_rgba_premultiplied(27, 28, 31, 115);
 const TEXT_1: Color32 = Color32::from_rgb(222, 222, 222);
 const TEXT_2: Color32 = Color32::from_rgb(152, 152, 151);
 const LIME: Color32 = Color32::from_rgb(188, 224, 117);
@@ -36,8 +37,17 @@ fn settings_window(app: &mut LaunchDeckApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             egui::Frame::none()
                 .fill(WIN_BG)
-                .rounding(12.0)
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(20, 20, 20, 20)))
+                .rounding(14.0)
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_premultiplied(255, 255, 255, 26),
+                ))
+                .shadow(egui::epaint::Shadow {
+                    offset: egui::vec2(0.0, 8.0),
+                    blur: 28.0,
+                    spread: 0.0,
+                    color: Color32::from_black_alpha(100),
+                })
                 .show(ui, |ui| {
                     ui.set_width(SET_W);
                     ui.set_height(set_h);
@@ -497,11 +507,42 @@ fn settings_interface(app: &mut LaunchDeckApp, ui: &mut egui::Ui, p: &Pal) {
             .selected_text(app.layout.sort_mode.label())
             .width(86.0)
             .show_ui(ui, |ui| {
-                for m in [SortMode::Custom, SortMode::Name, SortMode::LastUsed] {
+                for m in [
+                    SortMode::Custom,
+                    SortMode::Name,
+                    SortMode::DateAdded,
+                    SortMode::LastUsed,
+                ] {
                     if ui
                         .selectable_value(&mut app.layout.sort_mode, m, m.label())
                         .clicked()
                     {
+                        let _ = crate::layout_store::save(&app.layout);
+                        app.reorganize();
+                    }
+                }
+            });
+    });
+    row(ui, p, "同时排序文件夹内应用", None, |ui| {
+        if toggle(ui, &mut app.settings.sort_folders_too, TAB_BLUE) {
+            let _ = launchdeck_core::save_settings(&app.settings);
+        }
+    });
+    row(ui, p, "Apple 应用位置", None, |ui| {
+        egui::ComboBox::from_id_source("apple-placement")
+            .selected_text(app.settings.apple_placement.label())
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for v in [
+                    launchdeck_core::ApplePlacement::Mixed,
+                    launchdeck_core::ApplePlacement::Before,
+                    launchdeck_core::ApplePlacement::After,
+                ] {
+                    if ui
+                        .selectable_value(&mut app.settings.apple_placement, v, v.label())
+                        .clicked()
+                    {
+                        let _ = launchdeck_core::save_settings(&app.settings);
                         app.reorganize();
                     }
                 }
@@ -519,6 +560,7 @@ fn settings_interface(app: &mut LaunchDeckApp, ui: &mut egui::Ui, p: &Pal) {
             } else {
                 crate::layout::BrowsingStyle::Scroll
             };
+            app.browse_scroll = 0.0;
             let _ = crate::layout_store::save(&app.layout);
         }
     });
@@ -535,10 +577,24 @@ fn settings_interface(app: &mut LaunchDeckApp, ui: &mut egui::Ui, p: &Pal) {
         ui,
         p,
         "整理空位",
-        Some("根据当前行列布局，将 App 向前整理以填补空位。"),
+        Some("将应用向前整理以填补空位；「当前页」只整理正在浏览的页。"),
         |ui| {
+            egui::ComboBox::from_id_source("tidy-scope")
+                .selected_text(["当前页", "全部页"][app.tidy_scope.min(1)])
+                .width(74.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut app.tidy_scope, 0, "当前页");
+                    ui.selectable_value(&mut app.tidy_scope, 1, "全部页");
+                });
             if small_button(ui, "重新整理", p) {
-                app.reorganize();
+                if app.tidy_scope == 0 {
+                    app.reorganize_current_page();
+                } else {
+                    crate::layout_store::reflow(&mut app.layout);
+                    app.clamp_page();
+                    let _ = crate::layout_store::save(&app.layout);
+                    app.status = "已整理全部页面".into();
+                }
             }
         },
     );
@@ -613,10 +669,11 @@ fn display_thumb(app: &mut LaunchDeckApp, ui: &mut egui::Ui, mode: DisplayMode, 
 
 fn settings_apps(app: &mut LaunchDeckApp, ui: &mut egui::Ui, p: &Pal) {
     heading(ui, "应用来源", p);
+    // 默认扫描目录（只读）
     ui.horizontal(|ui| {
         ui.add_space(0.0);
         ui.vertical(|ui| {
-            let (r, _) = ui.allocate_exact_size(egui::vec2(360.0, 81.0), Sense::hover());
+            let (r, _) = ui.allocate_exact_size(egui::vec2(360.0, 52.0), Sense::hover());
             ui.painter().rect_filled(r, 10.0, CARD_BG);
             ui.painter().text(
                 egui::pos2(r.min.x + 12.0, r.min.y + 16.0),
@@ -632,15 +689,57 @@ fn settings_apps(app: &mut LaunchDeckApp, ui: &mut egui::Ui, p: &Pal) {
                 FontId::proportional(9.5),
                 p.sub,
             );
-            ui.painter().text(
-                egui::pos2(r.min.x + 12.0, r.max.y - 14.0),
-                Align2::LEFT_CENTER,
-                "＋   －",
-                FontId::proportional(11.0),
-                p.sub,
-            );
         });
     });
+    ui.add_space(6.0);
+    // 用户自定义扫描目录（可增删）
+    let mut removed: Option<usize> = None;
+    let mut added = false;
+    for (i, src) in app.settings.custom_sources.iter().enumerate() {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(360.0, 26.0), Sense::hover());
+        ui.painter().rect_filled(r, 8.0, CARD_BG);
+        ui.painter().text(
+            egui::pos2(r.min.x + 12.0, r.center().y),
+            Align2::LEFT_CENTER,
+            src,
+            FontId::proportional(10.5),
+            p.text,
+        );
+        let bx = Rect::from_min_size(
+            egui::pos2(r.max.x - 30.0, r.center().y - 9.0),
+            egui::vec2(20.0, 18.0),
+        );
+        if ui
+            .interact(bx, egui::Id::new(("rm-src", i)), Sense::click())
+            .clicked()
+        {
+            removed = Some(i);
+        }
+        ui.painter().text(
+            bx.center(),
+            Align2::CENTER_CENTER,
+            "－",
+            FontId::proportional(11.0),
+            p.sub,
+        );
+    }
+    if small_button(ui, "＋ 添加文件夹…", p) {
+        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+            let path = dir.to_string_lossy().to_string();
+            if !app.settings.custom_sources.contains(&path) {
+                app.settings.custom_sources.push(path);
+                added = true;
+            }
+        }
+    }
+    if let Some(i) = removed {
+        app.settings.custom_sources.remove(i);
+        added = true;
+    }
+    if added {
+        let _ = launchdeck_core::save_settings(&app.settings);
+        app.start_scan();
+    }
 
     heading(ui, "隐藏的应用", p);
     row(ui, p, "在搜索结果中隐藏应用", None, |ui| {
@@ -719,6 +818,7 @@ fn settings_advanced(app: &mut LaunchDeckApp, ui: &mut egui::Ui, p: &Pal) {
                 .show_ui(ui, |ui| {
                     for v in [
                         ReturnHome::Never,
+                        ReturnHome::Always,
                         ReturnHome::FiveMinutes,
                         ReturnHome::OneMinute,
                         ReturnHome::ThirtySeconds,
@@ -726,6 +826,38 @@ fn settings_advanced(app: &mut LaunchDeckApp, ui: &mut egui::Ui, p: &Pal) {
                         ReturnHome::FiveSeconds,
                     ] {
                         ui.selectable_value(&mut app.settings.return_home, v, v.label());
+                    }
+                });
+        },
+    );
+    row(
+        ui,
+        p,
+        "触控板捏合",
+        Some("捏合打开启动台，张开关闭；需要 NSEvent 全局监听生效"),
+        |ui| {
+            egui::ComboBox::from_id_source("pinch")
+                .selected_text(app.settings.pinch_gesture.label())
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for v in [
+                        launchdeck_core::PinchGesture::Off,
+                        launchdeck_core::PinchGesture::Three,
+                        launchdeck_core::PinchGesture::FourOrFive,
+                        launchdeck_core::PinchGesture::Five,
+                    ] {
+                        if ui
+                            .selectable_value(&mut app.settings.pinch_gesture, v, v.label())
+                            .clicked()
+                        {
+                            crate::native::set_pinch_fingers(match v {
+                                launchdeck_core::PinchGesture::Off => 0,
+                                launchdeck_core::PinchGesture::Three => 3,
+                                launchdeck_core::PinchGesture::FourOrFive => 4,
+                                launchdeck_core::PinchGesture::Five => 5,
+                            });
+                            let _ = launchdeck_core::save_settings(&app.settings);
+                        }
                     }
                 });
         },
@@ -781,7 +913,7 @@ fn settings_advanced(app: &mut LaunchDeckApp, ui: &mut egui::Ui, p: &Pal) {
         ui.add_space(10.0);
     }
 
-    // 整理布局：整张卡片就是一个按钮
+    // 整理布局：整张卡片就是一个按钮，点开页面选择弹窗
     {
         let r = card(ui, 52.0);
         let hit = r.shrink2(egui::vec2(10.0, 10.0));
@@ -796,7 +928,7 @@ fn settings_advanced(app: &mut LaunchDeckApp, ui: &mut egui::Ui, p: &Pal) {
         ui.painter().text(
             egui::pos2(r.min.x + 10.0, r.min.y + 34.0),
             Align2::LEFT_CENTER,
-            "根据所选规则重新整理布局",
+            "选择页面，把所选页面里的应用收拢到一起",
             FontId::proportional(11.0),
             TEXT_2,
         );
@@ -808,17 +940,50 @@ fn settings_advanced(app: &mut LaunchDeckApp, ui: &mut egui::Ui, p: &Pal) {
             );
         }
         if resp.clicked() {
-            app.reorganize();
+            app.tidy_popup_open = true;
         }
         ui.add_space(10.0);
     }
 
     heading(ui, "更新", p);
     row(ui, p, "自动检查更新", None, |ui| {
-        toggle(ui, &mut app.settings.auto_update, TAB_BLUE);
+        if toggle(ui, &mut app.settings.auto_update, TAB_BLUE) {
+            let _ = launchdeck_core::save_settings(&app.settings);
+            if app.settings.auto_update {
+                app.spawn_update_check();
+            }
+        }
     });
-    row(ui, p, "自动下载更新", None, |ui| {
-        toggle(ui, &mut app.settings.auto_download, TAB_BLUE);
+    row(
+        ui,
+        p,
+        "自动下载更新",
+        Some("发现新版本时自动打开下载页"),
+        |ui| {
+            if toggle(ui, &mut app.settings.auto_download, TAB_BLUE) {
+                let _ = launchdeck_core::save_settings(&app.settings);
+            }
+        },
+    );
+    row(ui, p, "检查更新", None, |ui| {
+        if small_button(ui, "立即检查", p) {
+            app.spawn_update_check();
+        }
+        if let Some(info) = &app.update_info {
+            if small_button(ui, "前往下载", p) {
+                let _ = std::process::Command::new("/usr/bin/open")
+                    .arg(&info.url)
+                    .spawn();
+            }
+        }
+        if !app.update_status.is_empty() {
+            let text = ui.label(egui::RichText::new(&app.update_status).size(9.5).color(TEXT_2));
+            if let Some(info) = &app.update_info {
+                if !info.notes.is_empty() {
+                    text.on_hover_text(&info.notes);
+                }
+            }
+        }
     });
 }
 
@@ -1348,12 +1513,12 @@ fn uninstall_window(app: &mut LaunchDeckApp, ctx: &egui::Context) {
                         if ui
                             .add_enabled(
                                 app.selected.len() == 1,
-                                egui::Button::new("移到废纸篓"),
+                                egui::Button::new("卸载…"),
                             )
                             .clicked()
                         {
                             if let Some(bid) = app.selected.iter().next().cloned() {
-                                app.confirm_delete = Some(bid);
+                                app.open_uninstall_detail(&bid);
                             }
                         }
                         ui.label(
@@ -1368,6 +1533,249 @@ fn uninstall_window(app: &mut LaunchDeckApp, ctx: &egui::Context) {
                     });
                 });
         });
+}
+
+/// 深度卸载确认面板：残留分类勾选 + 运行中检测 + 完全磁盘访问提示
+fn uninstall_detail_dialog(app: &mut LaunchDeckApp, ctx: &egui::Context) {
+    if app.uninstall_detail.is_none() {
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let p = pal(app);
+    let w = 480.0;
+    let h = 520.0;
+    let pos = screen.center() - egui::vec2(w, h) / 2.0;
+
+    let mut action: Option<bool> = None; // Some(true)=确认 Some(false)=取消
+    let mut quit_clicked = false;
+    let mut checks: Vec<(usize, bool)> = Vec::new();
+
+    egui::Area::new(egui::Id::new("uninstall-detail"))
+        .fixed_pos(pos)
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(p.panel)
+                .rounding(14.0)
+                .stroke(Stroke::new(1.0_f32, p.panel_border))
+                .inner_margin(egui::Margin::same(20.0))
+                .show(ui, |ui| {
+                    ui.set_width(w - 40.0);
+                    let Some(d) = app.uninstall_detail.as_ref() else { return };
+                    ui.label(
+                        egui::RichText::new(format!("卸载「{}」", d.name))
+                            .size(16.0)
+                            .strong(),
+                    );
+                    ui.label(egui::RichText::new(&d.path).size(9.5).color(p.sub));
+                    ui.add_space(8.0);
+
+                    if d.running {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "「{}」正在运行。强制退出可能导致未保存的更改丢失。",
+                                d.name
+                            ))
+                            .size(11.0)
+                            .color(Color32::from_rgb(240, 160, 90)),
+                        );
+                        let label = if d.attempts > 0 { "强制退出" } else { "退出并继续" };
+                        if ui.button(label).clicked() {
+                            quit_clicked = true;
+                        }
+                        ui.add_space(6.0);
+                    }
+
+                    if d.residues.is_empty() {
+                        ui.label(
+                            egui::RichText::new("没有找到相关残留文件，仅移除应用本身。")
+                                .size(11.0)
+                                .color(p.sub),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("将一并移除以下文件（勾选后移入废纸篓）：")
+                                .size(11.0)
+                                .color(p.sub),
+                        );
+                        ui.add_space(4.0);
+                        for i in 0..d.residues.len() {
+                            let (kind, size, mut checked) = {
+                                let d = app.uninstall_detail.as_ref().unwrap();
+                                (d.residues[i].kind.label(), d.residues[i].size, d.checked[i])
+                            };
+                            ui.horizontal(|ui| {
+                                if ui.checkbox(&mut checked, kind).changed() {
+                                    checks.push((i, checked));
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format_bytes(size))
+                                                .size(9.0)
+                                                .color(p.sub),
+                                        );
+                                    },
+                                );
+                            });
+                        }
+                    }
+
+                    if !launchdeck_core::uninstall::full_disk_access_granted() {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "缺少「完全磁盘访问权限」，容器 / WebKit 等受保护残留可能扫描不到。",
+                            )
+                            .size(10.0)
+                            .color(Color32::from_rgb(240, 160, 90)),
+                        );
+                        if small_button(ui, "打开系统设置", &p) {
+                            let _ = std::process::Command::new("/usr/bin/open")
+                                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                                .spawn();
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            action = Some(false);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let total: u64 = d
+                                .residues
+                                .iter()
+                                .zip(&d.checked)
+                                .filter(|(_, c)| **c)
+                                .map(|(r, _)| r.size)
+                                .sum();
+                            let label = if d.residues.is_empty() {
+                                "移到废纸篓".to_string()
+                            } else {
+                                format!("移到废纸篓（{}）", format_bytes(total))
+                            };
+                            if ui
+                                .add_enabled(
+                                    !d.running,
+                                    egui::Button::new(
+                                        egui::RichText::new(label).color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(200, 70, 70)),
+                                )
+                                .clicked()
+                            {
+                                action = Some(true);
+                            }
+                        });
+                    });
+                });
+        });
+
+    for (i, v) in checks {
+        if let Some(dd) = app.uninstall_detail.as_mut() {
+            if i < dd.checked.len() {
+                dd.checked[i] = v;
+            }
+        }
+    }
+    if quit_clicked {
+        app.quit_running_app();
+    }
+    match action {
+        Some(true) => app.confirm_uninstall_detail(),
+        Some(false) => app.uninstall_detail = None,
+        None => {}
+    }
+}
+
+/// 「整理布局」页面选择弹窗：所选页面里的应用收拢到这些页
+fn tidy_pages_dialog(app: &mut LaunchDeckApp, ctx: &egui::Context) {
+    if !app.tidy_popup_open {
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let p = pal(app);
+    let n = app.layout.page_count();
+    let w = 320.0;
+    let h = (150.0 + n as f32 * 30.0).min(430.0);
+    let pos = screen.center() - egui::vec2(w, h) / 2.0;
+    let mut action: Option<bool> = None;
+
+    egui::Area::new(egui::Id::new("tidy-pages"))
+        .fixed_pos(pos)
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(p.panel)
+                .rounding(14.0)
+                .stroke(Stroke::new(1.0_f32, p.panel_border))
+                .inner_margin(egui::Margin::same(20.0))
+                .show(ui, |ui| {
+                    ui.set_width(w - 40.0);
+                    ui.label(egui::RichText::new("整理布局").size(16.0).strong());
+                    ui.label(
+                        egui::RichText::new("选择要整理的页面，所选页面中的应用会被收拢到这些页里。")
+                            .size(11.0)
+                            .color(p.sub),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if small_button(ui, "全选", &p) {
+                            app.tidy_selected = (0..n).collect();
+                        }
+                        if small_button(ui, "清空", &p) {
+                            app.tidy_selected.clear();
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(h - 150.0)
+                        .show(ui, |ui| {
+                            for i in 0..n {
+                                let mut on = app.tidy_selected.contains(&i);
+                                if ui
+                                    .checkbox(&mut on, format!("第 {} 页", i + 1))
+                                    .changed()
+                                {
+                                    if on {
+                                        app.tidy_selected.insert(i);
+                                    } else {
+                                        app.tidy_selected.remove(&i);
+                                    }
+                                }
+                            }
+                        });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            action = Some(false);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !app.tidy_selected.is_empty(),
+                                    egui::Button::new(
+                                        egui::RichText::new("整理").color(Color32::WHITE),
+                                    )
+                                    .fill(TAB_BLUE),
+                                )
+                                .clicked()
+                            {
+                                action = Some(true);
+                            }
+                        });
+                    });
+                });
+        });
+
+    match action {
+        Some(true) => app.reorganize_selected_pages(),
+        Some(false) => app.tidy_popup_open = false,
+        None => {}
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {

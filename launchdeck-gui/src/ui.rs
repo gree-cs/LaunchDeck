@@ -68,14 +68,22 @@ pub fn draw(app: &mut LaunchDeckApp, ctx: &egui::Context) {
                 paint_background(app, ui);
                 // 网格始终绘制：文件夹是浮在网格之上的浮层，
                 // 这样打开/关闭文件夹时背景不会突然消失再出现（闪烁来源）。
-                if app.search.trim().is_empty() {
-                    grid_page(app, ui);
+                if app.search.trim().is_empty() && app.category_filter.is_some() {
+                    category_results(app, ui);
+                } else if app.search.trim().is_empty() {
+                    if app.layout.browsing_style == crate::layout::BrowsingStyle::Scroll {
+                        scroll_view(app, ui);
+                    } else {
+                        grid_page(app, ui);
+                    }
                 } else {
                     search_results(app, ui);
                 }
                 if app.open_folder.is_none() {
                     search_bar(app, ui);
-                    page_dots(app, ui);
+                    if app.layout.browsing_style == crate::layout::BrowsingStyle::Paged {
+                        page_dots(app, ui);
+                    }
                     // 最后注册，保证盖过网格的整屏交互
                     if app.search.trim().is_empty() {
                         let r = search_rect(ui.max_rect());
@@ -86,7 +94,9 @@ pub fn draw(app: &mut LaunchDeckApp, ctx: &egui::Context) {
                             Sense::click(),
                         );
                         if resp.clicked() {
-                            app.tab = Tab::Settings;
+                            app.main_menu_open = !app.main_menu_open;
+                            app.main_menu_types_open = false;
+                            app.menu_open_at_frame = ui.ctx().frame_nr();
                         }
                     }
                 }
@@ -99,8 +109,90 @@ pub fn draw(app: &mut LaunchDeckApp, ctx: &egui::Context) {
         _ => {}
     }
 
+    // 搜索栏「⋯」打开的主菜单（与空白处右键菜单同一套内容）
+    if app.main_menu_open
+        && app.visible
+        && !app.closing
+        && app.tab == Tab::Launchpad
+        && app.open_folder.is_none()
+    {
+        draw_main_menu(app, ctx);
+    }
+
     folder_view(app, ctx);
     confirm_dialog(app, ctx);
+    uninstall_detail_dialog(app, ctx);
+    tidy_pages_dialog(app, ctx);
+    app_rename_overlay(app, ctx);
+}
+
+/// 应用重命名浮层（右键「重命名」）
+fn app_rename_overlay(app: &mut LaunchDeckApp, ctx: &egui::Context) {
+    if app.renaming_app.is_none() {
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let p = pal(app);
+    let w = 320.0;
+    let h = 118.0;
+    let pos = screen.center() - egui::vec2(w, h) / 2.0;
+    let mut commit: Option<String> = None;
+
+    egui::Area::new(egui::Id::new("app-rename"))
+        .fixed_pos(pos)
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(p.panel)
+                .rounding(12.0)
+                .stroke(Stroke::new(1.0_f32, p.panel_border))
+                .inner_margin(egui::Margin::same(16.0))
+                .show(ui, |ui| {
+                    ui.set_width(w - 32.0);
+                    ui.label(egui::RichText::new("重命名").size(14.0).strong());
+                    ui.add_space(4.0);
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut app.edit_text)
+                            .id(egui::Id::new("app-rename-box"))
+                            .desired_width(w - 64.0),
+                    );
+                    if app.focus_editing {
+                        resp.request_focus();
+                        app.focus_editing = false;
+                    }
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if enter {
+                        commit = Some(app.edit_text.trim().to_string());
+                    }
+                    if esc {
+                        app.renaming_app = None;
+                        app.edit_text.clear();
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            app.renaming_app = None;
+                            app.edit_text.clear();
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("保存").clicked() {
+                                commit = Some(app.edit_text.trim().to_string());
+                            }
+                        });
+                    });
+                });
+        });
+
+    if let Some(name) = commit {
+        if name.is_empty() {
+            app.renaming_app = None;
+        } else {
+            app.commit_app_rename(&name);
+            app.renaming_app = None;
+            app.edit_text.clear();
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 背景
@@ -201,12 +293,16 @@ fn search_bar(app: &mut LaunchDeckApp, ui: &mut egui::Ui) {
         Stroke::new(1.8_f32, Color32::from_gray(195)),
     );
 
-    // 空态占位文字（原版起点 x=左沿+47，中心 y=65.5）
+    // 空态占位文字（原版起点 x=左沿+47，中心 y=65.5）；类型筛选激活时显示筛选状态
     if app.search.is_empty() {
+        let placeholder = match &app.category_filter {
+            Some(c) => format!("类型：{}（Esc 清除）", LaunchDeckApp::category_label(c)),
+            None => "搜索应用".to_string(),
+        };
         ui.painter().text(
             egui::pos2(r.min.x + 47.0, r.min.y + 24.5),
             Align2::LEFT_CENTER,
-            "搜索应用",
+            placeholder,
             FontId::proportional(12.5),
             Color32::from_rgb(196, 202, 208),
         );
@@ -398,30 +494,19 @@ fn grid_page(app: &mut LaunchDeckApp, ui: &mut egui::Ui) {
 
     // 悬停光斑已按需求移除（只保留图标轻微放大）
 
-    // 拖拽视觉：跟随指针的图标 + 目标格高亮
-    if let Some(drag) = &app.drag {
+    // 拖拽：目标图标高亮（烟灰玻璃，应用与文件夹一致——
+    // 压在文件夹上即「选中文件夹」，松手直接进入；文件夹间移动同样高亮目标）
+    if app.drag.is_some() {
         if let Some(pos) = ui.ctx().pointer_interact_pos() {
             if let Some(target) = geom.cell_at(pos) {
-                let cell = geom.cell(target);
-                let hl = geom.icon_rect(cell).expand(7.0);
-                ui.painter().rect_filled(
-                    hl,
-                    hl.width() * 0.24,
-                    Color32::from_rgba_premultiplied(255, 255, 255, 26),
-                );
-            }
-            let icon = match &drag.item {
-                Item::App { app: a } => app.icons.get(ui.ctx(), &a.path),
-                Item::Folder { .. } => None,
-            };
-            if let Some(t) = icon {
-                let r = Rect::from_center_size(pos, Vec2::splat(geom.icon * 0.95));
-                ui.painter().image(
-                    t.id(),
-                    r,
-                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::from_white_alpha(235),
-                );
+                if geom.hit_rect(geom.cell(target)).contains(pos) {
+                    let hl = geom.icon_rect(geom.cell(target)).expand(2.5);
+                    ui.painter().rect_filled(
+                        hl,
+                        hl.width() * 0.24,
+                        Color32::from_rgba_premultiplied(9, 11, 15, 52),
+                    );
+                }
             }
             ui.ctx().request_repaint();
         }
@@ -436,6 +521,30 @@ fn grid_page(app: &mut LaunchDeckApp, ui: &mut egui::Ui) {
         ui.ctx().request_repaint();
     } else {
         draw_page(app, ui, &p, &geom, app.page, 0.0, rect, true);
+    }
+
+    // 顶层：拖拽幽灵图标（盖在网格之上）
+    if app.drag.is_some() {
+        // 幽灵图标跟随指针（文件夹视图可见时它的自绘幽灵在上层，
+        // 面板收起后由这里的幽灵接管，拖出的图标不会消失）
+        if let (Some(pos), Some(drag)) = (
+            ui.ctx().pointer_interact_pos().or_else(crate::e2e::ghost_pos),
+            app.drag.as_ref(),
+        ) {
+            let icon = match &drag.item {
+                Item::App { app: a } => app.icons.get(ui.ctx(), &a.path),
+                Item::Folder { .. } => None,
+            };
+            if let Some(t) = icon {
+                let r = Rect::from_center_size(pos, Vec2::splat(geom.icon * 0.95));
+                ui.painter().image(
+                    t.id(),
+                    r,
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::from_white_alpha(235),
+                );
+            }
+        }
     }
 }
 
@@ -495,41 +604,22 @@ fn draw_page(
         if app.settings.display_mode == DisplayMode::Window && bg.drag_started() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
-        bg.context_menu(|ui| {
-            if ui.button("设置…").clicked() {
-                app.tab = Tab::Settings;
-                ui.close_menu();
-            }
-            if ui.button("全选").clicked() {
-                app.select_all_page();
-                ui.close_menu();
-            }
-            if !app.selected.is_empty() && ui.button("取消选择").clicked() {
-                app.selected.clear();
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("刷新应用").clicked() {
-                app.start_scan();
-                ui.close_menu();
-            }
-            if ui.button("卸载应用…").clicked() {
-                app.tab = Tab::Uninstall;
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("退出").clicked() {
-                std::process::exit(0);
-            }
-        });
+        bg.context_menu(|ui| main_menu(app, ui));
     }
 
-    // 拖动中的图标：从原位"拿走"，后面的图标依次前移，原位空出来
+    // 拖动中的图标：从原位"拿走"，后面的图标依次前移，原位空出来；
+    // 前移动画用指数平滑，图标滑过去而不是跳格
     let drag_src = app
         .drag
         .as_ref()
         .filter(|d| d.from_page == page)
         .map(|d| d.from_index);
+    if app.drag.is_none() {
+        app.drag_offsets.clear();
+    }
+    let dt = ui.ctx().input(|i| i.stable_dt).min(0.05);
+    // 柔和的挤占动画：约 0.3s 缓出到位
+    let smoothing = 1.0 - (-dt * 10.0).exp();
 
     for idx in 0..(geom.cols * geom.rows) {
         let Some(item) = items.get(idx) else { continue };
@@ -540,7 +630,16 @@ fn draw_page(
             Some(src) if idx > src => idx - 1,
             _ => idx,
         };
-        let cell = geom.cell(slot).translate(egui::vec2(offset, 0.0));
+        let mut cell = geom.cell(slot).translate(egui::vec2(offset, 0.0));
+        if drag_src.is_some() {
+            // 平滑：从原位滑向预览格
+            let origin_x = geom.cell(idx).translate(egui::vec2(offset, 0.0)).min.x;
+            let target_x = cell.min.x;
+            let e = app.drag_offsets.entry((page, idx)).or_insert((origin_x, 0.0));
+            e.0 += (target_x - e.0) * smoothing;
+            cell = Rect::from_min_size(egui::pos2(e.0, cell.min.y), cell.size());
+            ui.ctx().request_repaint();
+        }
         let id = egui::Id::new(("tile", page, idx));
         let resp = ui.interact(geom.hit_rect(cell), id, Sense::click_and_drag());
         let hover_t = ui
@@ -577,15 +676,14 @@ fn draw_page(
             }
             if resp.drag_stopped() {
                 // 预览时源图标已被抽走、后面的格子前移了一位，
-                // 这里把"预览格"换算回原始下标再交给 drop_at
+                // drop_at 现在直接接收可见格下标（内部换算原始下标）
                 let src = app.drag.as_ref().map(|d| d.from_index);
+                let _ = src;
                 if let Some(pos) = ui.ctx().pointer_interact_pos() {
                     if let Some(slot) = geom.cell_at(pos) {
-                        let to_index = match src {
-                            Some(s) if slot >= s => slot + 1,
-                            _ => slot,
-                        };
-                        app.drop_at(page, to_index.min(items.len()));
+                        // 只有指针真正压在这一格的图标上才允许合并成文件夹
+                        let on_icon = geom.hit_rect(geom.cell(slot)).contains(pos);
+                        app.drop_at(page, slot, on_icon);
                     }
                 }
                 app.drag = None;
@@ -614,7 +712,12 @@ fn draw_page(
                     if sel.width() > 4.0 || sel.height() > 4.0 {
                         for idx in 0..(geom.cols * geom.rows) {
                             if let Some(Item::App { app: a }) = items.get(idx) {
-                                if geom.cell(idx).translate(egui::vec2(offset, 0.0)).intersects(sel) {
+                                // 框选必须碰到图标本体（不是整格）才选中
+                                if geom
+                                    .icon_rect(geom.cell(idx))
+                                    .translate(egui::vec2(offset, 0.0))
+                                    .intersects(sel)
+                                {
                                     app.selected.insert(a.bundle_id.clone());
                                 }
                             }
@@ -640,17 +743,47 @@ fn draw_page(
             );
         }
 
-        // 拖拽
+        // 拖拽落点（幽灵图标在 grid_page 顶层绘制）
         if app.drag.is_some() {
-            if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
-                ui.painter().circle_filled(
-                    pos,
-                    16.0,
-                    Color32::from_rgba_unmultiplied(120, 170, 255, 170),
-                );
-            }
             if ui.input(|i| i.pointer.any_released()) {
                 if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+                    // 从文件夹拖出：面板内松手 = 排序；面板外压在另一个
+                    // 文件夹图标上 = 直接移入该文件夹；否则移出到落点
+                    if let Some(d) = app.drag.as_ref() {
+                        if let Some(fid) = d.from_folder.clone() {
+                            let idx = d.from_index;
+                            let inside = app
+                                .folder_panel_rect
+                                .map(|r| r.contains(pos))
+                                .unwrap_or(false);
+                            app.drag = None;
+                            app.folder_drag_active = false;
+                            if inside {
+                                if let Some(panel) = app.folder_panel_rect {
+                                    app.reorder_folder(&fid, idx, pos, panel);
+                                }
+                                app.folder_closing = false;
+                            } else {
+                                // 落点压在另一个文件夹图标上 → 文件夹间移动
+                                let mut dest: Option<String> = None;
+                                if let Some(slot) = geom.cell_at(pos) {
+                                    if geom.hit_rect(geom.cell(slot)).contains(pos) {
+                                        if let Some(Item::Folder { folder }) = items.get(slot) {
+                                            if folder.id != fid {
+                                                dest = Some(folder.id.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(dest) = dest {
+                                    app.move_app_between_folders(&fid, idx, &dest);
+                                } else {
+                                    app.drag_app_out_of_folder(&fid, idx, Some(pos));
+                                }
+                            }
+                            return;
+                        }
+                    }
                     let target_page = if pos.x < 12.0 {
                         page.saturating_sub(1)
                     } else if pos.x > rect.max.x - 12.0 {
@@ -658,8 +791,15 @@ fn draw_page(
                     } else {
                         page
                     };
-                    let index = geom.cell_at(pos).unwrap_or(items.len().saturating_sub(1));
-                    app.drop_at(target_page, index);
+                    // 没落在任何格子里 → 追加到目标页末尾（不合并文件夹）
+                    let (index, on_icon) = match geom.cell_at(pos) {
+                        Some(slot) => (
+                            slot,
+                            geom.hit_rect(geom.cell(slot)).contains(pos),
+                        ),
+                        None => (items.len(), false),
+                    };
+                    app.drop_at(target_page, index, on_icon);
                 } else {
                     app.drag = None;
                 }
@@ -698,12 +838,12 @@ fn draw_tile(
     let icon_r = Rect::from_center_size(icon_c, Vec2::splat(icon_size));
 
     if selected {
-        // 原版的选中态：图标外一圈浅色圆角高亮（不是蓝色蒙版）
-        let ring = icon_r.expand(4.0);
+        // 选中态：紧贴图标的一层小玻璃——只有深色半透底，无描边无白色元素
+        let ring = icon_r.expand(2.5);
         painter.rect_filled(
             ring,
             ring.width() * 0.24,
-            Color32::from_rgba_premultiplied(255, 255, 255, 28),
+            Color32::from_rgba_premultiplied(9, 11, 15, 56),
         );
     }
 
@@ -739,8 +879,23 @@ fn draw_tile(
             // 图标样式只影响 App 自身图标（Dock/菜单栏），不再给网格图标加描边
         }
         Item::Folder { folder } => {
+            // 拖拽悬停时文件夹稍稍放大（接收指示，带 0.12s 平滑）
+            let mut drag_over = false;
+            if app.drag.is_some() {
+                if let Some(pos) = ui.ctx().pointer_interact_pos().or_else(crate::e2e::ghost_pos) {
+                    drag_over = geom.hit_rect(cell).contains(pos);
+                }
+            }
+            let hover_t = ui.ctx().animate_bool_with_time(
+                egui::Id::new(("fd-hv", cell.min.x as i32, cell.min.y as i32)),
+                drag_over,
+                0.12,
+            );
             // 原版文件夹底是几乎透明的毛玻璃，外框尺寸与可见图标一致（约 104）
-            let tile = Rect::from_center_size(icon_c, Vec2::splat(geom.icon * 0.809));
+            let tile = Rect::from_center_size(
+                icon_c,
+                Vec2::splat(geom.icon * 0.809 * (1.0 + 0.07 * hover_t)),
+            );
             let radius = tile.width() * 0.24;
             // 原版文件夹底是几乎透明的毛玻璃（约 +10 灰阶）。
             // 注意：egui 的 from_white_alpha 会把数值当线性 alpha 再转 sRGB，
@@ -884,13 +1039,30 @@ fn page_dots(app: &mut LaunchDeckApp, ui: &mut egui::Ui) {
 
 fn search_results(app: &mut LaunchDeckApp, ui: &mut egui::Ui) {
     let results = app.search_results();
+    results_grid(app, ui, results, "没有找到匹配的应用", true);
+}
+
+/// 类型筛选视图（类型筛选激活且搜索为空时显示）
+fn category_results(app: &mut LaunchDeckApp, ui: &mut egui::Ui) {
+    let results = app.filtered_items();
+    results_grid(app, ui, results, "该类型下没有应用", false);
+}
+
+/// 搜索 / 类型筛选共用的结果网格；`clear_search` 决定点空白清除搜索还是清除筛选
+fn results_grid(
+    app: &mut LaunchDeckApp,
+    ui: &mut egui::Ui,
+    results: Vec<Item>,
+    empty: &str,
+    clear_search: bool,
+) {
     let rect = ui.max_rect();
     let p = pal(app);
     if results.is_empty() {
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "没有找到匹配的应用",
+            empty,
             FontId::proportional(13.0),
             Color32::from_white_alpha(140),
         );
@@ -899,13 +1071,13 @@ fn search_results(app: &mut LaunchDeckApp, ui: &mut egui::Ui) {
     let geom = Geom::new(rect, app.layout.columns, app.layout.rows);
     let mut launch: Option<crate::layout::AppRef> = None;
     let mut open_folder: Option<String> = None;
-    let mut clear_search = false;
+    let mut clear = false;
 
-    let bg = ui.interact(rect, egui::Id::new("search-bg"), Sense::click());
+    let bg = ui.interact(rect, egui::Id::new("results-bg"), Sense::click());
     if bg.clicked() {
         if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
             if geom.cell_at(pos).is_none() {
-                clear_search = true;
+                clear = true;
             }
         }
     }
@@ -931,15 +1103,410 @@ fn search_results(app: &mut LaunchDeckApp, ui: &mut egui::Ui) {
             launch = Some(a.clone());
         }
     }
-    if clear_search {
-        app.search.clear();
+    if clear {
+        if clear_search {
+            app.search.clear();
+        } else {
+            app.category_filter = None;
+        }
     }
     if let Some(id) = open_folder {
         app.open_folder = Some(id);
     }
     if let Some(a) = launch {
         app.open(&a);
-        app.search.clear();
+        if clear_search {
+            app.search.clear();
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 滚动浏览
+
+/// 连续滚动模式：所有应用按列排成一张长网格，滚轮纵向浏览
+fn scroll_view(app: &mut LaunchDeckApp, ui: &mut egui::Ui) {
+    if app.apps.is_empty() {
+        ui.centered_and_justified(|ui| {
+            if app.scanning {
+                ui.spinner();
+            } else if ui.button("扫描应用").clicked() {
+                app.start_scan();
+            }
+        });
+        return;
+    }
+
+    let rect = ui.max_rect();
+    let p = pal(app);
+    let e = ease_out(app.show_anim);
+    let zoom = 0.965 + 0.035 * e;
+    let grid_rect = Rect::from_center_size(rect.center(), rect.size() * zoom);
+    let cols = app.layout.columns.max(1);
+    let geom = Geom::new(grid_rect, cols, app.layout.rows);
+    let total: Vec<Item> = app.layout.pages.iter().flat_map(|pg| pg.items.clone()).collect();
+    let rows_n = total.len().div_ceil(cols);
+    let content_h = geom.y0 + rows_n as f32 * geom.row_h + 40.0;
+    let max_scroll = (content_h - rect.height()).max(0.0);
+    app.browse_scroll = app.browse_scroll.clamp(0.0, max_scroll);
+
+    // 滚轮
+    let dy = ui.input(|i| i.raw_scroll_delta.y);
+    if dy != 0.0 {
+        app.browse_scroll = (app.browse_scroll - dy).clamp(0.0, max_scroll);
+        ui.ctx().request_repaint();
+    }
+
+    // 点空白处收起（与分页模式一致）
+    let bg = ui.interact(rect, egui::Id::new("scroll-bg"), Sense::click());
+    if bg.clicked() {
+        if !app.selected.is_empty() {
+            app.selected.clear();
+        } else {
+            app.hide_window();
+        }
+    }
+
+    let off = app.browse_scroll;
+    let cap = app.layout.capacity().max(1);
+    let drag_src = app.drag.as_ref().map(|d| d.from_page * cap + d.from_index);
+    if app.drag.is_none() {
+        app.drag_offsets.clear();
+    }
+    let dt = ui.ctx().input(|i| i.stable_dt).min(0.05);
+    let smoothing = 1.0 - (-dt * 10.0).exp();
+
+    // 命中计算要把滚动偏移加回去
+    let slot_at = |pos: egui::Pos2| -> Option<usize> {
+        let col = ((pos.x - (geom.x0 - geom.tile_w / 2.0)) / geom.tile_w).floor() as isize;
+        let row = ((pos.y + off - geom.y0) / geom.row_h).floor() as isize;
+        if col < 0 || row < 0 || col >= cols as isize {
+            None
+        } else {
+            Some(row as usize * cols + col as usize)
+        }
+    };
+
+    let mut launch: Option<crate::layout::AppRef> = None;
+    let mut open_folder: Option<String> = None;
+    let mut cmd_toggle: Option<String> = None;
+
+    for (flat, item) in total.iter().enumerate() {
+        if drag_src == Some(flat) {
+            continue; // 被拖走的图标不画在原位
+        }
+        let slot = match drag_src {
+            Some(s) if flat > s => flat - 1,
+            _ => flat,
+        };
+        let mut cell = geom.cell(slot).translate(egui::vec2(0.0, -off));
+        if drag_src.is_some() {
+            // 与分页视图一致的平滑：图标滑向预览格
+            let origin_x = geom.cell(flat).min.x;
+            let target_x = geom.cell(slot).min.x;
+            let e = app
+                .drag_offsets
+                .entry((usize::MAX, flat))
+                .or_insert((origin_x, 0.0));
+            e.0 += (target_x - e.0) * smoothing;
+            cell = Rect::from_min_size(
+                egui::pos2(e.0, cell.min.y),
+                cell.size(),
+            );
+            ui.ctx().request_repaint();
+        }
+        if cell.max.y < rect.min.y - 40.0 || cell.min.y > rect.max.y + 40.0 {
+            continue; // 视口外不画不交互
+        }
+        let resp = ui.interact(geom.hit_rect(cell), egui::Id::new(("s-tile", flat)), Sense::click_and_drag());
+        let hover_t = ui
+            .ctx()
+            .animate_bool_with_time(egui::Id::new(("s-hv", flat)), resp.hovered(), 0.12);
+        draw_tile(
+            app,
+            ui,
+            &p,
+            &geom,
+            item,
+            cell,
+            hover_t,
+            app.selected.contains(item.bundle_id()),
+        );
+        if resp.clicked() {
+            let cmd = ui.input(|i| i.modifiers.command);
+            match item {
+                Item::App { app: a } => {
+                    if cmd {
+                        cmd_toggle = Some(a.bundle_id.clone());
+                    } else {
+                        launch = Some(a.clone());
+                    }
+                }
+                Item::Folder { folder } => open_folder = Some(folder.id.clone()),
+            }
+        }
+        if resp.drag_started() {
+            let (pg, idx) = (flat / cap, flat % cap);
+            app.begin_drag(item.clone(), pg, idx);
+        }
+        resp.context_menu(|ui| context_menu(app, ui, item, flat % cap, flat / cap));
+    }
+
+    // 拖拽预览 + 落点（高亮只在压到图标上显示，烟灰玻璃；压在文件夹上同样
+    // 高亮，松手直接进入，不展开预览）
+    if app.drag.is_some() {
+        if let Some(pos) = ui.ctx().pointer_interact_pos().or_else(crate::e2e::ghost_pos) {
+            if let Some(target) = slot_at(pos) {
+                let cell = geom.cell(target);
+                if geom.hit_rect(cell).contains(pos) {
+                    let hl = geom
+                        .icon_rect(cell.translate(egui::vec2(0.0, -off)))
+                        .expand(2.5);
+                    ui.painter().rect_filled(
+                        hl,
+                        hl.width() * 0.24,
+                        Color32::from_rgba_premultiplied(9, 11, 15, 52),
+                    );
+                }
+            }
+        }
+
+        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            let icon = match &app.drag.as_ref().unwrap().item {
+                Item::App { app: a } => app.icons.get(ui.ctx(), &a.path),
+                Item::Folder { .. } => None,
+            };
+            if let Some(t) = icon {
+                let r = Rect::from_center_size(pos, Vec2::splat(geom.icon * 0.95));
+                ui.painter().image(
+                    t.id(),
+                    r,
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::from_white_alpha(235),
+                );
+            }
+            ui.ctx().request_repaint();
+        }
+        if ui.input(|i| i.pointer.any_released()) {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+                // 从文件夹拖出：面板内 = 排序；面板外 = 移出（落点按分页网格近似）
+                if let Some(d) = app.drag.as_ref() {
+                    if let Some(fid) = d.from_folder.clone() {
+                        let idx = d.from_index;
+                        let inside = app
+                            .folder_panel_rect
+                            .map(|r| r.contains(pos))
+                            .unwrap_or(false);
+                        app.drag = None;
+                        app.folder_drag_active = false;
+                        if inside {
+                            if let Some(panel) = app.folder_panel_rect {
+                                app.reorder_folder(&fid, idx, pos, panel);
+                            }
+                            app.folder_closing = false;
+                        } else {
+                            app.drag_app_out_of_folder(&fid, idx, Some(pos));
+                        }
+                        return;
+                    }
+                }
+                // 没落在格子里 → 追加到末尾；压在图标上才允许合并
+                let (slot, on_icon) = match slot_at(pos) {
+                    Some(s) => (
+                        s,
+                        geom.hit_rect(geom.cell(s).translate(egui::vec2(0.0, -off)))
+                            .contains(pos),
+                    ),
+                    None => (total.len(), false),
+                };
+                let (pg, idx) = (slot / cap, slot % cap);
+                app.drop_at(pg, idx, on_icon);
+            }
+            app.drag = None;
+        }
+    }
+
+    if let Some(id) = cmd_toggle {
+        if !app.selected.remove(&id) {
+            app.selected.insert(id);
+        }
+    }
+    if let Some(f) = open_folder {
+        app.open_folder = Some(f);
+        app.folder_closing = false;
+    }
+    if let Some(a) = launch {
+        app.open(&a);
+    }
+
+    // 滚动条
+    if max_scroll > 0.0 {
+        let track = Rect::from_min_size(
+            egui::pos2(rect.max.x - 6.0, rect.min.y + 4.0),
+            egui::vec2(3.0, rect.height() - 8.0),
+        );
+        let bar_h = (track.height() * rect.height() / content_h).max(24.0);
+        let bar_y = track.min.y + (track.height() - bar_h) * (off / max_scroll);
+        let bar = Rect::from_min_size(
+            egui::pos2(track.min.x, bar_y),
+            egui::vec2(track.width(), bar_h),
+        );
+        ui.painter()
+            .rect_filled(bar, 1.5, Color32::from_rgba_premultiplied(200, 200, 200, 90));
+        let resp = ui.interact(bar.expand(4.0), egui::Id::new("scroll-thumb"), Sense::drag());
+        if resp.dragged() {
+            let delta = ui.ctx().input(|i| i.pointer.delta().y);
+            let ratio = max_scroll / (track.height() - bar_h).max(1.0);
+            app.browse_scroll = (app.browse_scroll + delta * ratio).clamp(0.0, max_scroll);
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 主菜单
+
+/// 主菜单内容（空白处右键与搜索栏「⋯」共用）
+/// 弹出菜单行：悬停高亮 + 左对齐文字（替代 egui 默认按钮的原生菜单观感）
+fn menu_row(ui: &mut egui::Ui, text: &str, checked: bool) -> bool {
+    let w = ui.available_width();
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(w, 27.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(
+            r,
+            6.0,
+            Color32::from_rgba_premultiplied(255, 255, 255, 22),
+        );
+    }
+    let mut x = r.min.x + 12.0;
+    if checked {
+        ui.painter().text(
+            egui::pos2(x + 5.0, r.center().y),
+            Align2::LEFT_CENTER,
+            "✓",
+            FontId::proportional(11.0),
+            Color32::from_rgb(120, 170, 255),
+        );
+        x += 20.0;
+    }
+    ui.painter().text(
+        egui::pos2(x, r.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(12.5),
+        Color32::from_rgb(236, 239, 243),
+    );
+    resp.clicked()
+}
+
+/// 弹出菜单分隔线
+fn menu_sep(ui: &mut egui::Ui) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 9.0), egui::Sense::hover());
+    ui.painter().line_segment(
+        [
+            egui::pos2(r.min.x + 9.0, r.center().y),
+            egui::pos2(r.max.x - 9.0, r.center().y),
+        ],
+        Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_premultiplied(255, 255, 255, 18),
+        ),
+    );
+}
+
+fn main_menu(app: &mut LaunchDeckApp, ui: &mut egui::Ui) {
+    ui.set_width(184.0);
+    if menu_row(ui, "设置…", false) {
+        app.tab = Tab::Settings;
+        app.main_menu_open = false;
+        ui.close_menu();
+    }
+    if menu_row(ui, "全选", false) {
+        app.select_all_page();
+        app.main_menu_open = false;
+        ui.close_menu();
+    }
+    if !app.selected.is_empty() && menu_row(ui, "取消选择", false) {
+        app.selected.clear();
+        app.main_menu_open = false;
+        ui.close_menu();
+    }
+    menu_sep(ui);
+    if menu_row(ui, if app.main_menu_types_open { "类型 ▾" } else { "类型 ▸" }, app.category_filter.is_some()) {
+        app.main_menu_types_open = !app.main_menu_types_open;
+    }
+    if app.main_menu_types_open {
+        // 类别手风琴：与行同样的交互，选中项打勾
+        let mut all = app.category_filter.is_none();
+        if menu_row(ui, "全部", all) && all {
+            app.set_category_filter(None);
+            app.main_menu_open = false;
+            ui.close_menu();
+        }
+        let opts = app.category_options();
+        for (raw, label) in opts {
+            let on = app.category_filter.as_deref() == Some(raw.as_str());
+            if menu_row(ui, label, on) && !on {
+                app.set_category_filter(Some(raw));
+                app.main_menu_open = false;
+                ui.close_menu();
+            }
+        }
+    }
+    menu_sep(ui);
+    if menu_row(ui, "刷新应用", false) {
+        app.start_scan();
+        app.main_menu_open = false;
+        ui.close_menu();
+    }
+    if menu_row(ui, "卸载应用…", false) {
+        app.tab = Tab::Uninstall;
+        app.main_menu_open = false;
+        ui.close_menu();
+    }
+    menu_sep(ui);
+    if menu_row(ui, "退出", false) {
+        std::process::exit(0);
+    }
+}
+
+/// 搜索栏「⋯」按钮弹出的主菜单浮层
+fn draw_main_menu(app: &mut LaunchDeckApp, ctx: &egui::Context) {
+    let screen = ctx.screen_rect();
+    let r = search_rect(screen);
+    let anchor = egui::pos2((r.max.x - 150.0).max(screen.min.x + 8.0), r.max.y + 8.0);
+    let mut area_rect = Rect::NOTHING;
+    egui::Area::new(egui::Id::new("main-menu-popup"))
+        .fixed_pos(anchor)
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(Color32::from_rgba_premultiplied(26, 28, 34, 242))
+                .rounding(12.0)
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_premultiplied(255, 255, 255, 26),
+                ))
+                // 阴影让菜单浮在网格上
+                .shadow(egui::epaint::Shadow {
+                    offset: egui::vec2(0.0, 6.0),
+                    blur: 24.0,
+                    spread: 0.0,
+                    color: Color32::from_black_alpha(90),
+                })
+                .inner_margin(egui::Margin::symmetric(4.0, 5.0))
+                .show(ui, |ui| {
+                    main_menu(app, ui);
+                });
+            area_rect = ui.min_rect();
+        });
+    // 打开当帧的点击就是「⋯」本身，跳过；之后点击菜单外任意位置关闭
+    if ctx.frame_nr() > app.menu_open_at_frame + 1 && ctx.input(|i| i.pointer.any_click()) {
+        let inside = ctx
+            .input(|i| i.pointer.latest_pos())
+            .map(|pos| area_rect.expand(6.0).contains(pos))
+            .unwrap_or(false);
+        if !inside {
+            app.main_menu_open = false;
+        }
     }
 }
 
@@ -991,6 +1558,7 @@ fn context_menu(app: &mut LaunchDeckApp, ui: &mut egui::Ui, item: &Item, index: 
                 ui.close_menu();
             }
             if ui.button("添加到程序坞").clicked() {
+                app.add_to_dock(a);
                 ui.close_menu();
             }
             ui.separator();
@@ -1005,10 +1573,22 @@ fn context_menu(app: &mut LaunchDeckApp, ui: &mut egui::Ui, item: &Item, index: 
             }
             if ui.button("重命名").clicked() {
                 app.editing_folder = None;
+                app.renaming_app = if a.bundle_id.is_empty() {
+                    Some(a.path.clone())
+                } else {
+                    Some(a.bundle_id.clone())
+                };
+                app.edit_text = a.name.clone();
+                app.focus_editing = true;
                 ui.close_menu();
             }
             if ui.button("卸载").clicked() {
-                app.confirm_delete = Some(a.bundle_id.clone());
+                let bid = if a.bundle_id.is_empty() {
+                    a.path.clone()
+                } else {
+                    a.bundle_id.clone()
+                };
+                app.open_uninstall_detail(&bid);
                 ui.close_menu();
             }
         }
@@ -1065,10 +1645,17 @@ fn folder_view(app: &mut LaunchDeckApp, ctx: &egui::Context) {
     } else if app.folder_anim > target {
         app.folder_anim = (app.folder_anim - step).max(target);
     }
-    if app.folder_closing && app.folder_anim <= 0.001 && !app.folder_drag_active {
+    if app.folder_closing && app.folder_anim <= 0.001 {
+        if app.folder_drag_active {
+            // 拖拽中面板已完全收起：停止绘制（网格接管落点，全局 release 路由）。
+            // 面板矩形必须清掉，否则残留的中央大矩形会把随后的松手误判成「放回」
+            app.folder_panel_rect = None;
+            return;
+        }
         app.open_folder = None;
         app.folder_closing = false;
         app.folder_anim = 0.0;
+        app.folder_panel_rect = None;
         return;
     }
     if (app.folder_anim - target).abs() > 0.001 {
@@ -1094,6 +1681,8 @@ fn folder_view(app: &mut LaunchDeckApp, ctx: &egui::Context) {
     // 展开动画：从 86% 放大到 100%
     let scale = 0.86 + 0.14 * anim;
     let panel = Rect::from_center_size(panel0.center(), panel0.size() * scale);
+    // 记录面板区域（拖出文件夹时的"放回 = 取消"判定用）
+    app.folder_panel_rect = Some(panel);
 
     // 文件夹背板：一层更重的模糊壁纸，把下面的图标糊掉（原版打开文件夹时的观感）
     let dim = ctx.layer_painter(egui::LayerId::new(
@@ -1123,8 +1712,6 @@ fn folder_view(app: &mut LaunchDeckApp, ctx: &egui::Context) {
 
     let mut launch: Option<crate::layout::AppRef> = None;
     let mut close_request = false;
-    let mut drag_out: Option<usize> = None;
-    let mut drop_pos: Option<egui::Pos2> = None;
 
     egui::Area::new(egui::Id::new("folder"))
         .fixed_pos(screen.min)
@@ -1258,21 +1845,88 @@ fn folder_view(app: &mut LaunchDeckApp, ctx: &egui::Context) {
 
             ui.set_clip_rect(panel);
             let first_row = app.folder_scroll.floor() as usize;
-            for (idx, a) in folder.apps.iter().enumerate() {
-                let row = idx / cols;
+            // 拖出 / 排序预览：被拖图标从原位移除，插入到指针所在的预览槽位
+            //（拖向面板外时保持「少一个图标」；在面板内移动时实时换位）
+            let dragging_this = app
+                .drag
+                .as_ref()
+                .map(|d| d.from_folder.as_deref() == Some(folder.id.as_str()))
+                .unwrap_or(false);
+            let from_idx = if dragging_this {
+                app.drag.as_ref().map(|d| d.from_index)
+            } else {
+                None
+            };
+            // 拖出收起：被拖图标一离开面板边缘就收起（粘性），随后即可在
+            // 网格上自由拖放、放进其他文件夹。触发必须独立于瓦片交互——
+            // 被拖瓦片已跳过渲染，挂在其响应上的检查永远不会触发
+            if dragging_this && !app.folder_closing {
+                let ppos = ui
+                    .ctx()
+                    .pointer_interact_pos()
+                    .or_else(crate::e2e::ghost_pos);
+                if let Some(pos) = ppos {
+                    let margin = geom.icon * 0.55;
+                    if !panel.shrink(margin).contains(pos) {
+                        app.folder_closing = true;
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            let dt2 = ctx.input(|i| i.stable_dt).min(0.05);
+            let folder_smoothing = 1.0 - (-dt2 * 10.0).exp();
+            if !dragging_this {
+                app.drag_offsets.clear();
+            }
+            let mut order: Vec<usize> = (0..folder.apps.len()).collect();
+            if let Some(fi) = from_idx {
+                if fi < order.len() {
+                    order.remove(fi);
+                }
+                if let Some(pos) = ui
+                    .ctx()
+                    .pointer_interact_pos()
+                    .or_else(crate::e2e::ghost_pos)
+                {
+                    if panel.contains(pos) {
+                        let col = ((pos.x - panel.min.x) / ftile).floor().max(0.0) as usize;
+                        let row = ((pos.y - geom.y0) / row_h).floor().max(0.0) as usize;
+                        let ps = (row * cols + col).min(order.len());
+                        order.insert(ps, fi);
+                    }
+                }
+            }
+            for (disp, &ai) in order.iter().enumerate() {
+                if Some(ai) == from_idx {
+                    continue; // 被拖图标原位空出（幽灵跟随指针）
+                }
+                let a = &folder.apps[ai];
+                let row = disp / cols;
                 if row < first_row || row >= first_row + visible_rows {
                     continue;
                 }
-                let cell = geom
-                    .cell(idx - first_row * cols)
+                let mut cell = geom
+                    .cell(disp - first_row * cols)
                     .translate(egui::vec2(0.0, 0.0));
+                if from_idx.is_some() {
+                    // 平滑：从原位滑向预览槽位（二维）
+                    let origin = geom.cell(ai - first_row * cols);
+                    let e = app
+                        .drag_offsets
+                        .entry((usize::MAX - 1, ai))
+                        .or_insert((origin.min.x, origin.min.y));
+                    e.0 += (cell.min.x - e.0) * folder_smoothing;
+                    e.1 += (cell.min.y - e.1) * folder_smoothing;
+                    cell = Rect::from_min_size(egui::pos2(e.0, e.1), cell.size());
+                    ctx.request_repaint();
+                }
                 let resp = ui.interact(
                     geom.hit_rect(cell),
-                    egui::Id::new(("f-tile", idx)),
+                    egui::Id::new(("f-tile", ai)),
                     Sense::click_and_drag(),
                 );
                 let t = ui.ctx().animate_bool_with_time(
-                    egui::Id::new(("f-hv", idx)),
+                    egui::Id::new(("f-hv", ai)),
                     resp.hovered(),
                     0.12,
                 );
@@ -1280,35 +1934,29 @@ fn folder_view(app: &mut LaunchDeckApp, ctx: &egui::Context) {
                 if resp.clicked() {
                     launch = Some(a.clone());
                 }
-                // 拖出面板即从文件夹移除
+                // 拖出文件夹：登记全局拖拽（带 from_folder 标记），
+                // 落点由全局 release 路由（面板收起后本视图不再接收事件）
                 if resp.drag_started() {
                     app.folder_drag_active = true;
+                    app.drag = Some(crate::app::DragState {
+                        item: Item::app(a.clone()),
+                        from_page: usize::MAX,
+                        from_index: ai,
+                        from_folder: Some(folder.id.clone()),
+                    });
                 }
-                if resp.dragged() {
-                    // 一离开面板就开始收起动画；拖回来则取消
-                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                        if !panel.contains(pos) {
-                            app.folder_closing = true;
-                        } else {
-                            app.folder_closing = false;
-                        }
-                    }
-                }
-                if resp.drag_stopped() {
-                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                        if std::env::var("LAUNCHDECK_NSDEBUG").is_ok() {
-                            eprintln!("[folder] drag_stopped idx={idx} pos={pos:?} inside={}", panel.contains(pos));
-                        }
-                        if !panel.contains(pos) {
-                            drag_out = Some(idx);
-                            drop_pos = Some(pos);
-                        }
-                    }
-                    app.folder_drag_active = false;
-                }
-                // 拖拽时让图标跟着指针
-                if resp.dragged() {
-                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            }
+
+            // 拖出中的幽灵：从拖拽状态独立绘制（不依赖瓦片交互——
+            // 被拖瓦片已跳过渲染，挂在其交互上的幽灵永远不会触发）。
+            // 先恢复整屏裁剪：面板内容裁剪会让面板外的幽灵被裁掉（看不见）
+            ui.set_clip_rect(screen);
+            if let (Some(pos), Some(d)) = (
+                ui.ctx().pointer_interact_pos().or_else(crate::e2e::ghost_pos),
+                app.drag.as_ref(),
+            ) {
+                if d.from_folder.as_deref() == Some(folder.id.as_str()) {
+                    if let Item::App { app: a } = &d.item {
                         if let Some(t) = app.icons.get(ui.ctx(), &a.path) {
                             let r = Rect::from_center_size(pos, egui::vec2(geom.icon, geom.icon));
                             ui.painter().image(
@@ -1352,12 +2000,6 @@ fn folder_view(app: &mut LaunchDeckApp, ctx: &egui::Context) {
             }
         });
 
-    if let Some(idx) = drag_out {
-        if std::env::var("LAUNCHDECK_NSDEBUG").is_ok() {
-            eprintln!("[folder] remove_from_folder idx={idx}");
-        }
-        app.drag_app_out_of_folder(&folder.id, idx, drop_pos);
-    }
     if close_request {
         app.folder_closing = true;
     }

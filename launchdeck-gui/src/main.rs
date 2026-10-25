@@ -1,6 +1,7 @@
 //! LaunchDeck - 纯 Rust Launchpad 复刻版
 
 mod app;
+mod e2e;
 mod icons;
 mod native;
 mod wallpaper;

@@ -4,6 +4,11 @@ version = "0.3.0"
 edition = "2021"
 description = "LaunchDeck GUI (pure Rust, egui)"
 
+[features]
+default = []
+# E2E 自动化测试钩子：指令注入 + 状态导出（生产构建不含）
+e2e = []
+
 [[bin]]
 name = "LaunchDeck"
 path = "src/main.rs"

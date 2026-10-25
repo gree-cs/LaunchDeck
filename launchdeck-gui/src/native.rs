@@ -3,10 +3,10 @@
 //! 快捷键使用 Carbon `RegisterEventHotKey`（Cocoa 应用可直接使用，
 //! 无需辅助功能权限）。触发角使用 CoreGraphics 轮询鼠标位置。
 
-use launchdeck_core::HotCorner;
+use launchdeck_core::{HotCorner, ScreenChoice};
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 static HOTKEY_PRESSED: AtomicBool = AtomicBool::new(false);
@@ -1144,4 +1144,488 @@ unsafe extern "C" fn swipe_callback(
         SWIPE_ACC.store((acc * 10.0) as i32, Ordering::SeqCst);
     }
     event
+}
+
+// ---------------------------------------------------------------- 触控板捏合手势
+
+// NSEvent 全局监听（公开 API，无需辅助功能权限）。
+// ObjC block 采用手搭的全局 block（_NSConcreteGlobalBlock，不捕获上下文）。
+static PINCH_ACC: AtomicI32 = AtomicI32::new(0); // 累计放大倍数 ×1000
+static PINCH_DIR: AtomicI32 = AtomicI32::new(0); // 1=捏合(打开) -1=张开(关闭)
+static PINCH_FINGERS: AtomicU8 = AtomicU8::new(0); // 最少手指数，0=关闭手势
+static PINCH_LAST: AtomicI64 = AtomicI64::new(0);
+
+#[repr(C)]
+struct ObjCBlock {
+    isa: *const c_void,
+    flags: c_int,
+    reserved: c_int,
+    invoke: unsafe extern "C" fn(*const ObjCBlock, *mut c_void),
+    descriptor: *const c_void,
+}
+
+#[repr(C)]
+struct ObjCBlockDescriptor {
+    reserved: usize,
+    size: usize,
+}
+
+static PINCH_BLOCK_DESC: ObjCBlockDescriptor = ObjCBlockDescriptor {
+    reserved: 0,
+    size: std::mem::size_of::<ObjCBlock>(),
+};
+
+extern "C" {
+    static _NSConcreteGlobalBlock: c_void;
+}
+
+static PINCH_BLOCK: ObjCBlock = ObjCBlock {
+    isa: unsafe { &_NSConcreteGlobalBlock },
+    flags: 0,
+    reserved: 0,
+    invoke: pinch_block_invoke,
+    descriptor: &PINCH_BLOCK_DESC as *const ObjCBlockDescriptor as *const c_void,
+};
+
+// 全局 block（_NSConcreteGlobalBlock）初始化后不可变，跨线程共享是安全的
+unsafe impl Sync for ObjCBlock {}
+
+unsafe extern "C" fn pinch_block_invoke(_b: *const ObjCBlock, event: *mut c_void) {
+    if event.is_null() {
+        return;
+    }
+    let min = PINCH_FINGERS.load(Ordering::SeqCst) as usize;
+    if min == 0 {
+        return;
+    }
+    // 手指数不满足设置时忽略
+    let touches = msg0(event, b"allTouches\0");
+    let n = if touches.is_null() { 0 } else { msg_usize(touches, b"count\0") };
+    if n > 0 && n < min {
+        return;
+    }
+    let mag = msg_f64(event, b"magnification\0");
+    // 1.5s 内没有后续事件则重新累计
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let last = PINCH_LAST.swap(now, Ordering::SeqCst);
+    if now - last > 1500 {
+        PINCH_ACC.store(0, Ordering::SeqCst);
+    }
+    let acc = PINCH_ACC.load(Ordering::SeqCst) as f64 / 1000.0 + mag;
+    if acc < -0.55 {
+        PINCH_DIR.store(1, Ordering::SeqCst); // 捏合 → 打开
+        PINCH_ACC.store(0, Ordering::SeqCst);
+        request_repaint();
+    } else if acc > 0.55 {
+        PINCH_DIR.store(-1, Ordering::SeqCst); // 张开 → 关闭
+        PINCH_ACC.store(0, Ordering::SeqCst);
+        request_repaint();
+    } else {
+        PINCH_ACC.store((acc * 1000.0) as i32, Ordering::SeqCst);
+    }
+}
+
+/// 安装捏合手势全局监听（NSEventTypeMagnify = 1 << 30）
+pub fn install_pinch_monitor() -> bool {
+    unsafe {
+        let f: extern "C" fn(*mut c_void, *mut c_void, u64, *const c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let mon = f(
+            cls(b"NSEvent\0"),
+            sel(b"addGlobalMonitorForEventsMatchingMask:handler:\0"),
+            1u64 << 30,
+            &PINCH_BLOCK as *const ObjCBlock as *const c_void,
+        );
+        let ok = !mon.is_null();
+        if std::env::var("LAUNCHDECK_NSDEBUG").is_ok() {
+            eprintln!("[ns] pinch monitor: {}", if ok { "ok" } else { "null" });
+        }
+        ok
+    }
+}
+
+/// 手指数阈值：0 关闭，3/4/5 对应设置项（四指或五指 = 4）
+pub fn set_pinch_fingers(min: u8) {
+    PINCH_FINGERS.store(min, Ordering::SeqCst);
+}
+
+/// 取出一次捏合动作：1=捏合打开，-1=张开关闭，0=无
+pub fn take_pinch() -> i32 {
+    PINCH_DIR.swap(0, Ordering::SeqCst)
+}
+
+// ---------------------------------------------------------------- 音效
+
+/// 播放移入废纸篓音效（系统无 trash 命名音时退回 Pop）
+pub fn play_trash_sound() {
+    unsafe {
+        let mut snd = msg1(cls(b"NSSound\0"), b"soundNamed:\0", nsstring("dragToTrash"));
+        if snd.is_null() {
+            snd = msg1(cls(b"NSSound\0"), b"soundNamed:\0", nsstring("Pop"));
+        }
+        if !snd.is_null() {
+            let _ = msg0(snd, b"play\0");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 多屏
+
+// NSPoint / NSSize / NSRect 复用上文 951-957 行的既有定义。
+
+unsafe fn msg_f64(obj: *mut c_void, s: &[u8]) -> f64 {
+    let f: extern "C" fn(*mut c_void, *mut c_void) -> f64 =
+        std::mem::transmute(objc_msgSend as *const ());
+    f(obj, sel(s))
+}
+
+unsafe fn msg_usize(obj: *mut c_void, s: &[u8]) -> usize {
+    let f: extern "C" fn(*mut c_void, *mut c_void) -> usize =
+        std::mem::transmute(objc_msgSend as *const ());
+    f(obj, sel(s))
+}
+
+// NSRect(32B) 走隐藏 sret 指针；NSPoint(16B) 直接经 x0/x1 返回。
+// arm64 的 objc_msgSend 对结构体返回无需 _stret 变体。
+unsafe fn msg_rect(obj: *mut c_void, s: &[u8]) -> NSRect {
+    let f: extern "C" fn(*mut c_void, *mut c_void) -> NSRect =
+        std::mem::transmute(objc_msgSend as *const ());
+    f(obj, sel(s))
+}
+
+unsafe fn msg_point(obj: *mut c_void, s: &[u8]) -> NSPoint {
+    let f: extern "C" fn(*mut c_void, *mut c_void) -> NSPoint =
+        std::mem::transmute(objc_msgSend as *const ());
+    f(obj, sel(s))
+}
+
+type CFArrayRef = *const c_void;
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFArrayGetCount(a: CFArrayRef) -> isize;
+    fn CFArrayGetValueAtIndex(a: CFArrayRef, i: isize) -> *const c_void;
+    fn CFDictionaryGetValue(d: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFNumberGetValue(n: *const c_void, ntype: isize, v: *mut c_void) -> bool;
+    fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, enc: u32) -> *const c_void;
+    static kCGWindowLayer: *const c_void;
+    static kCGWindowBounds: *const c_void;
+    static kCGWindowOwnerPID: *const c_void;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWindowListCopyWindowInfo(option: u32, relative: u32) -> CFArrayRef;
+}
+
+extern "C" {
+    fn getpid() -> i32;
+}
+
+unsafe fn cfstr(s: &str) -> *const c_void {
+    let c = std::ffi::CString::new(s).unwrap_or_default();
+    CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), 0x0800_0100) // kCFStringEncodingUTF8
+}
+
+/// 读取 CGWindow 字典的 bounds（已是左上角原点的 CG 坐标）
+unsafe fn window_bounds(dict: *const c_void) -> Option<(f64, f64, f64, f64)> {
+    let b = CFDictionaryGetValue(dict, kCGWindowBounds);
+    if b.is_null() {
+        return None;
+    }
+    let num = |key: &str| -> f64 {
+        let k = cfstr(key);
+        let v = CFDictionaryGetValue(b, k);
+        let mut out: f64 = 0.0;
+        if !v.is_null() {
+            CFNumberGetValue(v, 6, &mut out as *mut f64 as *mut c_void); // kCFNumberFloat64Type
+        }
+        out
+    };
+    Some((num("X"), num("Y"), num("Width"), num("Height")))
+}
+
+unsafe fn window_layer(dict: *const c_void) -> f64 {
+    let v = CFDictionaryGetValue(dict, kCGWindowLayer);
+    let mut out: f64 = 0.0;
+    if !v.is_null() {
+        CFNumberGetValue(v, 6, &mut out as *mut f64 as *mut c_void);
+    }
+    out
+}
+
+unsafe fn window_pid(dict: *const c_void) -> i32 {
+    let v = CFDictionaryGetValue(dict, kCGWindowOwnerPID);
+    let mut out: i32 = 0;
+    if !v.is_null() {
+        CFNumberGetValue(v, 3, &mut out as *mut i32 as *mut c_void); // kCFNumberSInt32Type
+    }
+    out
+}
+
+/// 目标屏幕的 frame（x/y 为左上角原点，单位：点）。查询失败返回 None，
+/// 由调用方退回当前显示器。
+pub fn screen_frame(choice: ScreenChoice) -> Option<(f64, f64, f64, f64)> {
+    unsafe {
+        let screens = msg0(cls(b"NSScreen\0"), b"screens\0");
+        if screens.is_null() {
+            return None;
+        }
+        let count = msg_usize(screens, b"count\0");
+        // AppKit 全局坐标（主屏左下角为原点，y 向上）
+        let mut frames: Vec<NSRect> = Vec::new();
+        for i in 0..count {
+            let s = msg1(screens, b"objectAtIndex:\0", i as *mut c_void);
+            frames.push(msg_rect(s, b"frame\0"));
+        }
+        // 主屏高度（原点 (0,0) 的那块）用于 AppKit → CG 翻转
+        let primary_h = frames
+            .iter()
+            .find(|f| f.origin.x == 0.0 && f.origin.y == 0.0)
+            .map(|f| f.size.height)
+            .unwrap_or(0.0);
+        let to_cg = |r: &NSRect| {
+            (
+                r.origin.x,
+                primary_h - r.origin.y - r.size.height,
+                r.size.width,
+                r.size.height,
+            )
+        };
+        let cg_frames: Vec<(f64, f64, f64, f64)> = frames.iter().map(to_cg).collect();
+        let contains_cg = |f: &(f64, f64, f64, f64), px: f64, py: f64| {
+            px >= f.0 && px < f.0 + f.2 && py >= f.1 && py < f.1 + f.3
+        };
+
+        match choice {
+            ScreenChoice::Main => {
+                let main = msg0(cls(b"NSScreen\0"), b"mainScreen\0");
+                if main.is_null() {
+                    return cg_frames.first().copied();
+                }
+                Some(to_cg(&msg_rect(main, b"frame\0")))
+            }
+            ScreenChoice::Cursor => {
+                let mp = msg_point(cls(b"NSEvent\0"), b"mouseLocation\0");
+                cg_frames
+                    .iter()
+                    .find(|f| {
+                        // 鼠标位置是 AppKit 坐标，先转成 CG
+                        let cgx = mp.x;
+                        let cgy = primary_h - mp.y;
+                        contains_cg(f, cgx, cgy)
+                    })
+                    .copied()
+            }
+            ScreenChoice::Dock => {
+                // Dock 自己的窗口：所有者叫 Dock，取面积最大的那块
+                let list = CGWindowListCopyWindowInfo(1, 0); // kCGWindowListOptionOnScreenOnly
+                if list.is_null() {
+                    return cg_frames.first().copied();
+                }
+                let n = CFArrayGetCount(list);
+                let mut best: Option<(f64, f64, f64, f64)> = None;
+                let mut best_area = 0.0;
+                for i in 0..n {
+                    let d = CFArrayGetValueAtIndex(list, i);
+                    // owner name 会被系统本地化（中文是「程序坞」），改按窗口层级识别
+                    if window_layer(d) != 20.0 {
+                        continue;
+                    }
+                    if let Some((x, y, w, h)) = window_bounds(d) {
+                        let area = w * h;
+                        if area > best_area {
+                            best_area = area;
+                            best = Some((x, y, w, h));
+                        }
+                    }
+                }
+                CFRelease(list);
+                let (x, y, _, _) = best?;
+                cg_frames
+                    .iter()
+                    .find(|f| contains_cg(f, x, y))
+                    .copied()
+            }
+            ScreenChoice::Active => {
+                // 从前往后第一块 layer 0、非本进程的普通窗口
+                let list = CGWindowListCopyWindowInfo(1, 0);
+                if list.is_null() {
+                    return None;
+                }
+                let n = CFArrayGetCount(list);
+                let me = getpid();
+                let mut found: Option<(f64, f64, f64, f64)> = None;
+                for i in 0..n {
+                    let d = CFArrayGetValueAtIndex(list, i);
+                    if window_layer(d) != 0.0 || window_pid(d) == me {
+                        continue;
+                    }
+                    if let Some(b) = window_bounds(d) {
+                        if b.2 > 100.0 && b.3 > 100.0 {
+                            found = Some(b);
+                            break;
+                        }
+                    }
+                }
+                CFRelease(list);
+                let (x, y, _, _) = found?;
+                cg_frames
+                    .iter()
+                    .find(|f| contains_cg(f, x, y))
+                    .copied()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 运行检测 / 退出
+
+/// 是否有正在运行的应用位于指定 bundle 路径
+pub fn app_running_at(path: &std::path::Path) -> bool {
+    unsafe {
+        let ws = msg0(cls(b"NSWorkspace\0"), b"sharedWorkspace\0");
+        if ws.is_null() {
+            return false;
+        }
+        let apps = msg0(ws, b"runningApplications\0");
+        if apps.is_null() {
+            return false;
+        }
+        let want = path.to_string_lossy().trim_end_matches('/').to_string();
+        let n = msg_usize(apps, b"count\0");
+        for i in 0..n {
+            let a = msg1(apps, b"objectAtIndex:\0", i as *mut c_void);
+            let url = msg0(a, b"bundleURL\0");
+            if url.is_null() {
+                continue;
+            }
+            let p = msg0(url, b"path\0");
+            if p.is_null() {
+                continue;
+            }
+            if let Some(s) = cfstring_to_string(p) {
+                if s.trim_end_matches('/') == want {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// 请求退出指定 bundle 路径的应用；force=true 时强制退出
+pub fn terminate_app_at(path: &std::path::Path, force: bool) {
+    unsafe {
+        let ws = msg0(cls(b"NSWorkspace\0"), b"sharedWorkspace\0");
+        if ws.is_null() {
+            return;
+        }
+        let apps = msg0(ws, b"runningApplications\0");
+        if apps.is_null() {
+            return;
+        }
+        let want = path.to_string_lossy().trim_end_matches('/').to_string();
+        let n = msg_usize(apps, b"count\0");
+        for i in 0..n {
+            let a = msg1(apps, b"objectAtIndex:\0", i as *mut c_void);
+            let url = msg0(a, b"bundleURL\0");
+            if url.is_null() {
+                continue;
+            }
+            let p = msg0(url, b"path\0");
+            if p.is_null() {
+                continue;
+            }
+                if let Some(s) = cfstring_to_string(p) {
+                    if s.trim_end_matches('/') == want {
+                        let action: &[u8] = if force {
+                            b"forceTerminate\0"
+                        } else {
+                            b"terminate\0"
+                        };
+                        let _ = msg0(a, action);
+                        return;
+                    }
+                }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_frame_returns_plausible_frame() {
+        // 主屏：frame 应该以 (0,0) 为原点且尺寸为正
+        let main = screen_frame(ScreenChoice::Main).expect("主屏 frame 不应为 None");
+        assert!((main.0 - 0.0).abs() < 1.0 && main.1.abs() < 1.0, "主屏原点应为 (0,0)");
+        assert!(main.2 > 500.0 && main.3 > 400.0, "主屏尺寸不合理: {main:?}");
+
+        // 鼠标屏：与某块屏幕的 frame 一致
+        let cur = screen_frame(ScreenChoice::Cursor).expect("鼠标屏 frame 不应为 None");
+        assert!(cur.2 > 0.0 && cur.3 > 0.0);
+
+        // Dock 屏 / 活动屏：Dock 与某个前台 app 总在运行，应能解析
+        let dock = screen_frame(ScreenChoice::Dock).expect("Dock 屏 frame 不应为 None");
+        assert!(dock.2 > 0.0);
+        let act = screen_frame(ScreenChoice::Active).expect("活动屏 frame 不应为 None");
+        assert!(act.2 > 0.0);
+    }
+
+    #[test]
+    fn app_running_finds_finder() {
+        assert!(app_running_at(std::path::Path::new(
+            "/System/Library/CoreServices/Finder.app"
+        )));
+        assert!(!app_running_at(std::path::Path::new(
+            "/Applications/DefinitelyNotRunningE2E.app"
+        )));
+    }
+
+    #[test]
+    fn pinch_monitor_installs_and_flags_roundtrip() {
+        // 在测试进程里也应能注册成功（NSEvent 类方法，无需 NSApp）
+        assert!(install_pinch_monitor(), "捏合监听注册失败");
+        set_pinch_fingers(3);
+        assert_eq!(take_pinch(), 0, "无手势时 take 应为 0");
+        set_pinch_fingers(0);
+    }
+
+    #[test]
+    fn trash_sound_does_not_panic() {
+        play_trash_sound();
+    }
+}
+
+/// 把一组路径移入废纸篓（NSWorkspace recycleURLs，无需 Finder 自动化权限）
+pub fn trash_paths(paths: &[String]) -> bool {
+    unsafe {
+        let arr = msg0(cls(b"NSMutableArray\0"), b"array\0");
+        if arr.is_null() {
+            return false;
+        }
+        for p in paths {
+            let url = msg1(cls(b"NSURL\0"), b"fileURLWithPath:\0", nsstring(p));
+            if !url.is_null() {
+                msg_void1(arr, b"addObject:\0", url);
+            }
+        }
+        let ws = msg0(cls(b"NSWorkspace\0"), b"sharedWorkspace\0");
+        if ws.is_null() {
+            return false;
+        }
+        let f: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> bool =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(
+            ws,
+            sel(b"recycleURLs:completionHandler:\0"),
+            arr,
+            std::ptr::null_mut(),
+        )
+    }
 }

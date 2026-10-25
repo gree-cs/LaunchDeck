@@ -116,9 +116,6 @@ pub struct LaunchLayout {
     pub columns: usize,
     pub rows: usize,
     pub hide_names: bool,
-    /// 是否来自原版 LaunchOS 布局导入（导入后不自动追加新应用）
-    #[serde(default)]
-    pub imported: bool,
     /// 版本号，用于兼容判断
     pub version: u32,
 }
@@ -136,7 +133,6 @@ impl Default for LaunchLayout {
             columns: 7,
             rows: 5,
             hide_names: false,
-            imported: false,
             version: 1,
         }
     }

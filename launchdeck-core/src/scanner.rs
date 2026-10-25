@@ -22,6 +22,13 @@ impl Default for AppScanner {
             PathBuf::from("/Applications/Utilities"),
             dirs::home_dir().unwrap_or_default().join("Applications"),
         ];
+        // 用户在设置里添加的自定义扫描目录
+        for src in crate::config::get_settings().custom_sources {
+            let p = PathBuf::from(src);
+            if p.is_dir() && !roots.contains(&p) {
+                roots.push(p);
+            }
+        }
         roots.retain(|p| p.exists());
 
         Self {
@@ -58,13 +65,20 @@ impl AppScanner {
                 .filter_map(|e| e.ok())
             {
                 let path = entry.path();
-                if !entry.file_type().is_dir() {
-                    continue;
-                }
                 if path.extension().and_then(|e| e.to_str()) != Some("app") {
                     continue;
                 }
                 if self.is_ignored(path) {
+                    continue;
+                }
+                // .app 目录直接解析；非目录的 .app（替身文件 / 符号链接）
+                // 也收集，由前端解析替身指向的目标后决定是否保留
+                if !entry.file_type().is_dir() {
+                    if let Ok(mut app) = Self::path_to_app_info(path) {
+                        app.is_alias = true;
+                        let key = app.id.clone();
+                        by_id.entry(key).or_insert(app);
+                    }
                     continue;
                 }
                 if let Ok(app) = Self::path_to_app_info(path) {
@@ -114,6 +128,8 @@ impl AppScanner {
             modified,
             is_hidden: false,
             is_system,
+            is_alias: false,
+            alias_path: None,
         })
     }
 
@@ -160,6 +176,11 @@ impl AppScanner {
             .filter(|m| m.is_file())
             .map(|m| m.len())
             .sum()
+    }
+
+    /// 读取指定 .app 的 CFBundleIdentifier（前端解析替身后补全信息用）
+    pub fn read_bundle_id(path: &Path) -> Option<String> {
+        Self::get_bundle_id(&path.join("Contents/Info.plist"))
     }
 }
 
